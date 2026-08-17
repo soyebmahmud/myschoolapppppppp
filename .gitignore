@@ -1,0 +1,5 @@
+.env
+.env.*
+uploads/
+*.log
+application/config/database.php
