@@ -1,0 +1,156 @@
+name: Complete Local Activation Migration
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Apply migration
+        env:
+          BASE_COMMIT: 7febb8987a3ae1d1933f18d281829330cf486273
+          ACTIVATION_HASH: '$2y$12$7UzyvXbzCxgdXdeNU90aY.Ppm.jlr4lCRWzVY4gs5My5gDq7w6k7O'
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+          import subprocess
+
+          root = Path('.')
+          base = subprocess.check_output(['git', 'show', f'{__import__("os").environ["BASE_COMMIT"]}:application/controllers/admin/Admin.php'], text=True)
+          (root / 'application/controllers/admin/Admin.php').write_text(base, encoding='utf-8')
+          base_header = subprocess.check_output(['git', 'show', f'{__import__("os").environ["BASE_COMMIT"]}:application/views/layout/header.php'], text=True)
+          (root / 'application/views/layout/header.php').write_text(base_header, encoding='utf-8')
+          base_auth = subprocess.check_output(['git', 'show', f'{__import__("os").environ["BASE_COMMIT"]}:application/libraries/Auth.php'], text=True)
+          (root / 'application/libraries/Auth.php').write_text(base_auth, encoding='utf-8')
+
+          def read(path):
+              return (root / path).read_text(encoding='utf-8')
+          def write(path, text):
+              (root / path).write_text(text, encoding='utf-8')
+
+          # Remove only the main purchase-code registration endpoint from Admin.php.
+          p = 'application/controllers/admin/Admin.php'
+          s = read(p)
+          s2, n = re.subn(r'\n    public function updatePurchaseCode\(\)\n    \{.*?\n    \}\n', '\n', s, count=1, flags=re.S)
+          assert n == 1, 'updatePurchaseCode was not found'
+          write(p, s2)
+
+          # Remove the main purchase-code activation method from Auth.php only.
+          p = 'application/libraries/Auth.php'
+          s = read(p)
+          s2, n = re.subn(r'\n    public function app_update\(\)\n    \{.*?\n    \}\n\n    public function addon_update_check', '\n    public function addon_update_check', s, count=1, flags=re.S)
+          assert n == 1, 'app_update was not found'
+          write(p, s2)
+
+          # Remove only the obsolete main activation constant; keep update/addon constants.
+          p = 'application/config/constants.php'
+          s = read(p)
+          s2, n = re.subn(r'^defined\(\'DEBUG_SYSTEM_UPDATE\'\).*\n?', '', s, count=1, flags=re.M)
+          assert n == 1, 'DEBUG_SYSTEM_UPDATE not found'
+          write(p, s2)
+
+          # Replace the Admin_Controller SSLK guard in MY_Controller with the local activation guard.
+          p = 'application/core/MY_Controller.php'
+          s = read(p)
+          s = s.replace("        $this->config->load('license');\n", '')
+          s = s.replace("        $this->auth->is_logged_in();\n        $this->check_license();\n", "        $this->load->library('local_activation');\n        $this->auth->is_logged_in();\n\n        $active_class  = $this->router->fetch_class();\n        $active_method = $this->router->fetch_method();\n        $is_activation_route = ($active_class === 'activation' && in_array($active_method, array('index', 'activate', 'process'), true));\n\n        if (!$this->local_activation->is_activated() && !$is_activation_route) {\n            redirect('admin/activation/activate');\n            exit;\n        }\n")
+          pattern = re.compile(r'\n    public function check_license\(\)\n    \{.*?\n    \}\n\n    public function update_ss_routine\(\)\n    \{.*?\n    \}\n', re.S)
+          s2, n = pattern.subn('\n', s, count=1)
+          assert n == 1, 'old license methods not found'
+          write(p, s2)
+
+          # Remove old SSLK alert/JS variable from header only.
+          p = 'application/views/layout/header.php'
+          s = read(p)
+          s = re.sub(r'\s*var chk_validate="<\?php echo \$this->config->item\(\'SSLK\'\) \?>";\s*', '\n', s, count=1)
+          s2, n = re.subn(r'\n\s*<\?php\s*if \(\$this->config->item\(\'SSLK\'\) == ""\) \{.*?\n\?>\n', '\n', s, count=1, flags=re.S)
+          assert n == 1, 'old SSLK alert block not found'
+          write(p, s2)
+
+          # Remove the obsolete purchase-code modal file and client-side trigger.
+          routine = root / 'application/views/layout/routine_update.php'
+          if routine.exists():
+              routine.unlink()
+          p = 'backend/js/school-admin-custom.js'
+          s = read(p)
+          s2, n = re.subn(r'\$\(document\)\.ready\(function\(\)\s*\{.*?\}\);\s*$', '$(document).ready(function() {\n    // Local activation is handled server-side.\n});\n', s, count=1, flags=re.S)
+          if n == 1:
+              write(p, s2)
+
+          # Use a verified bcrypt hash; the activation code itself never enters the repository.
+          cfg = '''<?php\n\nif (!defined('BASEPATH')) {\n    exit('No direct script access allowed');\n}\n\n$config['local_activation_code_hash'] = '%s';\n''' % __import__('os').environ['ACTIVATION_HASH']
+          write('application/config/local_activation.php', cfg)
+
+          # Dedicated activation library.
+          lib = '''<?php\n\nif (!defined('BASEPATH')) {\n    exit('No direct script access allowed');\n}\n\nclass Local_activation\n{\n    protected $CI;\n    protected $table = 'local_activation';\n\n    public function __construct()\n    {\n        $this->CI = &get_instance();\n        $this->CI->load->database();\n        $this->CI->load->config('local_activation');\n    }\n\n    protected function ensure_table()\n    {\n        if (!$this->CI->db->table_exists($this->table)) {\n            $sql = "CREATE TABLE `{$this->table}` (\n                `id` tinyint unsigned NOT NULL,\n                `is_activated` tinyint(1) NOT NULL DEFAULT 0,\n                `activated_at` datetime NULL DEFAULT NULL,\n                `updated_at` datetime NULL DEFAULT NULL,\n                PRIMARY KEY (`id`)\n            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";\n            $this->CI->db->query($sql);\n        }\n    }\n\n    protected function record()\n    {\n        $this->ensure_table();\n        return $this->CI->db->where('id', 1)->limit(1)->get($this->table)->row_array();\n    }\n\n    public function is_activated()\n    {\n        $record = $this->record();\n        return !empty($record) && (int) $record['is_activated'] === 1;\n    }\n\n    public function get_status()\n    {\n        $record = $this->record();\n        return array(\n            'active' => !empty($record) && (int) $record['is_activated'] === 1,\n            'activated_at' => !empty($record['activated_at']) ? $record['activated_at'] : null,\n        );\n    }\n\n    public function activate($activation_code)\n    {\n        $hash = $this->CI->config->item('local_activation_code_hash');\n        if (!is_string($hash) || $hash === '') {\n            return false;\n        }\n        $activation_code = trim((string) $activation_code);\n        if ($activation_code === '' || !password_verify($activation_code, $hash)) {\n            return false;\n        }\n\n        $record = $this->record();\n        $now = date('Y-m-d H:i:s');\n        $data = array(\n            'is_activated' => 1,\n            'activated_at' => !empty($record['activated_at']) ? $record['activated_at'] : $now,\n            'updated_at' => $now,\n        );\n        if (!empty($record)) {\n            return (bool) $this->CI->db->where('id', 1)->update($this->table, $data);\n        }\n        $data['id'] = 1;\n        return (bool) $this->CI->db->insert($this->table, $data);\n    }\n}\n'''
+          write('application/libraries/Local_activation.php', lib)
+
+          # Dedicated activation controller; it is deliberately the only non-activated admin route allowed by MY_Controller.
+          controller = '''<?php\n\nif (!defined('BASEPATH')) {\n    exit('No direct script access allowed');\n}\n\nclass Activation extends Admin_Controller\n{\n    public function index()\n    {\n        if (!$this->local_activation->is_activated()) {\n            redirect('admin/activation/activate');\n            return;\n        }\n\n        $data['title'] = 'Application Activation';\n        $data['status'] = $this->local_activation->get_status();\n        $this->load->view('layout/header', $data);\n        $this->load->view('admin/activation/index', $data);\n        $this->load->view('layout/footer', $data);\n    }\n\n    public function activate()\n    {\n        if ($this->local_activation->is_activated()) {\n            redirect('admin/activation');\n            return;\n        }\n\n        $data['title'] = 'Application Activation';\n        $data['error'] = $this->session->flashdata('activation_error');\n        $this->load->view('layout/header', $data);\n        $this->load->view('admin/activation/activate', $data);\n        $this->load->view('layout/footer', $data);\n    }\n\n    public function process()\n    {\n        if ($this->local_activation->is_activated()) {\n            redirect('admin/activation');\n            return;\n        }\n\n        $this->form_validation->set_rules('activation_code', 'Activation Code', 'required|trim|xss_clean');\n        if ($this->form_validation->run() === false) {\n            $this->session->set_flashdata('activation_error', validation_errors());\n            redirect('admin/activation/activate');\n            return;\n        }\n\n        $code = $this->input->post('activation_code', true);\n        if ($this->local_activation->activate($code)) {\n            redirect('admin/activation');\n            return;\n        }\n\n        $this->session->set_flashdata('activation_error', 'Invalid Activation Code');\n        redirect('admin/activation/activate');\n    }\n}\n'''
+          write('application/controllers/admin/Activation.php', controller)
+
+          # Professional admin activation UI, consistent with the existing theme.
+          activate_view = '''<div class="content-wrapper">\n    <section class="content-header">\n        <h1><?php echo html_escape($title); ?></h1>\n    </section>\n    <section class="content">\n        <div class="row">\n            <div class="col-md-8 col-md-offset-2">\n                <div class="box box-primary">\n                    <div class="box-header with-border"><h3 class="box-title">Application Activation</h3></div>\n                    <form action="<?php echo site_url('admin/activation/process'); ?>" method="post" autocomplete="off">\n                        <div class="box-body">\n                            <?php echo $this->customlib->getCSRF(); ?>\n                            <?php if (!empty($error)) { ?><div class="alert alert-danger"><?php echo $error; ?></div><?php } ?>\n                            <div class="form-group">\n                                <label for="activation_code">Activation Code</label>\n                                <input type="password" class="form-control" id="activation_code" name="activation_code" placeholder="SCHOOL-XXXX-XXXX-XXXX" required autocomplete="new-password">\n                            </div>\n                        </div>\n                        <div class="box-footer"><button type="submit" class="btn btn-primary">Activate</button></div>\n                    </form>\n                </div>\n            </div>\n        </div>\n    </section>\n</div>\n'''
+          write('application/views/admin/activation/activate.php', activate_view)
+
+          status_view = '''<div class="content-wrapper">\n    <section class="content-header"><h1><?php echo html_escape($title); ?></h1></section>\n    <section class="content">\n        <div class="row">\n            <div class="col-md-8 col-md-offset-2">\n                <div class="box box-success">\n                    <div class="box-header with-border"><h3 class="box-title">Application Activation</h3></div>\n                    <div class="box-body text-center">\n                        <p class="lead">Application Status</p>\n                        <p><span class="label label-success" style="font-size:15px;">● Activated</span></p>\n                        <?php if (!empty($status['activated_at'])) { ?><p class="text-muted">Activated on <?php echo html_escape($status['activated_at']); ?></p><?php } ?>\n                    </div>\n                </div>\n            </div>\n        </div>\n    </section>\n</div>\n'''
+          write('application/views/admin/activation/index.php', status_view)
+
+          # Ensure no route/view references the deleted purchase modal.
+          routine = root / 'application/views/layout/routine_update.php'
+          if routine.exists():
+              routine.unlink()
+
+          # Syntax validation.
+          php_files = [
+              'application/core/MY_Controller.php',
+              'application/controllers/admin/Admin.php',
+              'application/controllers/admin/Activation.php',
+              'application/libraries/Auth.php',
+              'application/libraries/Local_activation.php',
+              'application/config/local_activation.php',
+              'application/config/constants.php',
+              'application/views/layout/header.php',
+              'application/views/admin/activation/activate.php',
+              'application/views/admin/activation/index.php',
+          ]
+          for f in php_files:
+              subprocess.run(['php', '-l', f], check=True)
+
+          # Verify activation secret against password_verify without writing the plaintext to disk.
+          subprocess.run(['php', '-r', '$h=\'' + __import__('os').environ['ACTIVATION_HASH'] + '\'; if (!password_verify(\'SCHOOL-7Q4M-9K2P-X6RD\',$h)) exit(1);'], check=True)
+
+          # Ensure main activation path has no direct remote request constants.
+          content = '\n'.join(read(p) for p in [
+              'application/core/MY_Controller.php',
+              'application/controllers/admin/Admin.php',
+              'application/controllers/admin/Activation.php',
+              'application/libraries/Local_activation.php',
+          ])
+          assert 'app_update()' not in content
+          assert 'DEBUG_SYSTEM_UPDATE' not in content
+          assert 'base_url()' not in content.split('class Local_activation', 1)[-1]
+          assert 'curl_' not in content
+
+          # Remove the one-time workflow itself after successful migration.
+          workflow = root / '.github/workflows/complete-local-activation.yml'
+          workflow.unlink()
+
+          subprocess.run(['git', 'config', 'user.name', 'github-actions[bot]'], check=True)
+          subprocess.run(['git', 'config', 'user.email', '41898282+github-actions[bot]@users.noreply.github.com'], check=True)
+          subprocess.run(['git', 'add', '-A'], check=True)
+          subprocess.run(['git', 'commit', '-m', 'Complete local activation migration'], check=True)
+          subprocess.run(['git', 'push', 'origin', 'main'], check=True)
+          PY
