@@ -64,7 +64,6 @@ class Local_activation
             return false;
         }
 
-        $this->ensure_table();
         $now = date('Y-m-d H:i:s');
         $record = $this->record();
         $data = array(
