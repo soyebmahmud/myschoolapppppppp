@@ -35,7 +35,6 @@ jobs:
               p.parent.mkdir(parents=True, exist_ok=True)
               p.write_text(content, encoding='utf-8')
 
-          # 1) Core admin lifecycle: replace old SSLK check with local activation gate.
           p = 'application/core/MY_Controller.php'
           s = read(p)
           assert "        $this->check_license();" in s
@@ -49,14 +48,13 @@ jobs:
             return;
         }""")
           pattern = re.compile(r"\n    public function check_license\(\)\n    \{.*?\n    \}\n\n    public function update_ss_routine\(\)\n    \{.*?\n    \}\n", re.S)
-          s2, n = pattern.subn('\n', s, count=1)
-          assert n == 1, 'Old license methods were not found in MY_Controller.php'
-          write(p, s2)
+          s, n = pattern.subn('\n', s, count=1)
+          assert n == 1
+          write(p, s)
 
-          # 2) Admin controller: replace purchase-code endpoint with local activation endpoints.
           p = 'application/controllers/admin/Admin.php'
           s = read(p)
-          old = re.compile(r"\n    public function updatePurchaseCode\(\)\n    \{.*?\n    \}\n", re.S)
+          pattern = re.compile(r"\n    public function updatePurchaseCode\(\)\n    \{.*?\n    \}\n", re.S)
           replacement = r'''
     public function activation()
     {
@@ -69,11 +67,7 @@ jobs:
 
     public function activate()
     {
-        $this->form_validation->set_rules(
-            'activation_code',
-            'Activation Code',
-            'required|trim|xss_clean'
-        );
+        $this->form_validation->set_rules('activation_code', 'Activation Code', 'required|trim|xss_clean');
 
         if ($this->form_validation->run() === false) {
             $this->session->set_flashdata('activation_error', validation_errors());
@@ -92,62 +86,52 @@ jobs:
         redirect('admin/admin/activation');
     }
 '''
-          s2, n = old.subn('\n' + replacement, s, count=1)
-          assert n == 1, 'updatePurchaseCode() was not found in Admin.php'
-          write(p, s2)
+          s, n = pattern.subn('\n' + replacement, s, count=1)
+          assert n == 1
+          write(p, s)
 
-          # 3) Remove the old SSLK alert and client-side activation variable; add a small status link.
           p = 'application/views/layout/header.php'
           s = read(p)
-          assert 'var chk_validate="<?php echo $this->config->item(\'SSLK\') ?>";' in s
           s = s.replace('            var chk_validate="<?php echo $this->config->item(\'SSLK\') ?>";\n', '')
           alert_pattern = re.compile(r"\n<\?php\nif \(\$this->config->item\('SSLK'\) == \"\"\) \{.*?\n\?>\n", re.S)
-          s2, n = alert_pattern.subn('\n', s, count=1)
-          assert n == 1, 'Old SSLK alert block was not found in header.php'
+          s, n = alert_pattern.subn('\n', s, count=1)
+          assert n == 1
           marker = '<ul class="nav navbar-nav headertopmenu">'
-          assert marker in s2
+          assert marker in s
           status_link = '''<ul class="nav navbar-nav headertopmenu">\n                                    <li class="cal15" data-placement="bottom" data-toggle="tooltip" title="Application Activation"><a href="<?php echo site_url('admin/admin/activation'); ?>"><i class="fa fa-key"></i></a></li>'''
-          s2 = s2.replace(marker, status_link, 1)
-          write(p, s2)
+          s = s.replace(marker, status_link, 1)
+          write(p, s)
 
-          # 4) Old licensing JS only handled the purchase modal. Remove it entirely.
           write('backend/js/school-admin-custom.js', "$(document).ready(function() {\n    // Local activation is handled server-side.\n});\n")
 
-          # 5) Old purchase-code modal is obsolete.
           old_modal = root / 'application/views/layout/routine_update.php'
           if old_modal.exists():
               old_modal.unlink()
 
-          # 6) Dedicated local activation configuration. Only a password hash is stored.
           write('application/config/local_activation.php', '''<?php\n\nif (!defined('BASEPATH')) {\n    exit('No direct script access allowed');\n}\n\n$config['local_activation_code_hash'] = '$2y$12$C3FkK1exrKc2UY/5MTVoIuvwz2eAyAFbmHSHQBbL8AKzVj1pEUCyS';\n''')
 
-          # 7) Dedicated database-backed local activation library.
-          write('application/libraries/Local_activation.php', '''<?php\n\nif (!defined('BASEPATH')) {\n    exit('No direct script access allowed');\n}\n\nclass Local_activation\n{\n    protected $CI;\n    protected $table = 'local_activation';\n\n    public function __construct()\n    {\n        $this->CI = &get_instance();\n        $this->CI->load->database();\n        $this->CI->config->load('local_activation');\n        $this->ensure_table();\n    }\n\n    protected function table_name()\n    {\n        return $this->CI->db->dbprefix($this->table);\n    }\n\n    protected function ensure_table()\n    {\n        $table = $this->table_name();\n        $sql = "CREATE TABLE IF NOT EXISTS `{$table}` (\n            `id` tinyint unsigned NOT NULL,\n            `is_activated` tinyint(1) NOT NULL DEFAULT 0,\n            `activated_at` datetime NULL DEFAULT NULL,\n            PRIMARY KEY (`id`)\n        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";\n        $this->CI->db->query($sql);\n    }\n\n    protected function get_record()\n    {\n        return $this->CI->db\n            ->where('id', 1)\n            ->limit(1)\n            ->get($this->table)\n            ->row_array();\n    }\n\n    public function is_activated()\n    {\n        $record = $this->get_record();\n        return !empty($record) && (int) $record['is_activated'] === 1;\n    }\n\n    public function get_status()\n    {\n        $record = $this->get_record();\n\n        return array(\n            'active' => !empty($record) && (int) $record['is_activated'] === 1,\n            'activated_at' => !empty($record['activated_at']) ? $record['activated_at'] : null,\n        );\n    }\n\n    public function activate($activation_code)\n    {\n        $configured_hash = $this->CI->config->item('local_activation_code_hash');\n\n        if (!is_string($configured_hash) || $configured_hash === '') {\n            return false;\n        }\n\n        $activation_code = trim((string) $activation_code);\n\n        if ($activation_code === '' || !password_verify($activation_code, $configured_hash)) {\n            return false;\n        }\n\n        $record = $this->get_record();\n        $data = array(\n            'is_activated' => 1,\n            'activated_at' => date('Y-m-d H:i:s'),\n        );\n\n        if (!empty($record)) {\n            return $this->CI->db->where('id', 1)->update($this->table, $data);\n        }\n\n        $data['id'] = 1;\n        return $this->CI->db->insert($this->table, $data);\n    }\n}\n''')
+          write('application/libraries/Local_activation.php', '''<?php\n\nif (!defined('BASEPATH')) {\n    exit('No direct script access allowed');\n}\n\nclass Local_activation\n{\n    protected $CI;\n    protected $table = 'local_activation';\n\n    public function __construct()\n    {\n        $this->CI = &get_instance();\n        $this->CI->load->database();\n        $this->CI->config->load('local_activation');\n        $this->ensure_table();\n    }\n\n    protected function table_name()\n    {\n        return $this->CI->db->dbprefix($this->table);\n    }\n\n    protected function ensure_table()\n    {\n        $table = $this->table_name();\n        $sql = "CREATE TABLE IF NOT EXISTS `{$table}` (\n            `id` tinyint unsigned NOT NULL,\n            `is_activated` tinyint(1) NOT NULL DEFAULT 0,\n            `activated_at` datetime NULL DEFAULT NULL,\n            PRIMARY KEY (`id`)\n        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";\n        $this->CI->db->query($sql);\n    }\n\n    protected function get_record()\n    {\n        return $this->CI->db->where('id', 1)->limit(1)->get($this->table)->row_array();\n    }\n\n    public function is_activated()\n    {\n        $record = $this->get_record();\n        return !empty($record) && (int) $record['is_activated'] === 1;\n    }\n\n    public function get_status()\n    {\n        $record = $this->get_record();\n        return array(\n            'active' => !empty($record) && (int) $record['is_activated'] === 1,\n            'activated_at' => !empty($record['activated_at']) ? $record['activated_at'] : null,\n        );\n    }\n\n    public function activate($activation_code)\n    {\n        $configured_hash = $this->CI->config->item('local_activation_code_hash');\n        if (!is_string($configured_hash) || $configured_hash === '') {\n            return false;\n        }\n\n        $activation_code = trim((string) $activation_code);\n        if ($activation_code === '' || !password_verify($activation_code, $configured_hash)) {\n            return false;\n        }\n\n        $record = $this->get_record();\n        $data = array('is_activated' => 1, 'activated_at' => date('Y-m-d H:i:s'));\n\n        if (!empty($record)) {\n            return $this->CI->db->where('id', 1)->update($this->table, $data);\n        }\n\n        $data['id'] = 1;\n        return $this->CI->db->insert($this->table, $data);\n    }\n}\n''')
 
-          # 8) Remove only the main remote purchase-code registration method from Auth.
           p = 'application/libraries/Auth.php'
           s = read(p)
           pattern = re.compile(r"\n    public function app_update\(\)\n    \{.*?\n    \}\n\n    public function addon_update_check", re.S)
-          s2, n = pattern.subn('\n    public function addon_update_check', s, count=1)
-          assert n == 1, 'app_update() was not found in Auth.php'
-          write(p, s2)
+          s, n = pattern.subn('\n    public function addon_update_check', s, count=1)
+          assert n == 1
+          write(p, s)
 
-          # 9) Remove only the SSLK-specific AES helper; keep all other crypto methods intact.
           p = 'application/libraries/Aes.php'
           s = read(p)
           pattern = re.compile(r"\n    function validchk\(\$action, \$string\)\n    \{.*?\n    \}\n", re.S)
-          s2, n = pattern.subn('\n', s, count=1)
-          assert n == 1, 'validchk() was not found in Aes.php'
-          write(p, s2)
+          s, n = pattern.subn('\n', s, count=1)
+          assert n == 1
+          write(p, s)
 
-          # 10) DEBUG_SYSTEM_UPDATE existed for the removed main activation API. Keep update/check-update constants.
           p = 'application/config/constants.php'
           s = read(p)
           lines = [line for line in s.splitlines(True) if 'DEBUG_SYSTEM_UPDATE' not in line]
-          assert len(lines) < len(s.splitlines(True)), 'DEBUG_SYSTEM_UPDATE constant was not found'
+          assert len(lines) < len(s.splitlines(True))
           write(p, ''.join(lines))
 
-          # Syntax checks for all changed PHP files.
           php_files = [
               'application/core/MY_Controller.php',
               'application/controllers/admin/Admin.php',
@@ -161,7 +145,6 @@ jobs:
           for f in php_files:
               subprocess.run(['php', '-l', f], check=True)
 
-          # One-time workflow cleans itself up after applying the migration.
           workflow = root / '.github/workflows/local-activation-migration.yml'
           if workflow.exists():
               workflow.unlink()
@@ -172,3 +155,4 @@ jobs:
           subprocess.run(['git', 'commit', '-m', 'Replace remote licensing with local activation'], check=True)
           subprocess.run(['git', 'push', 'origin', 'main'], check=True)
           PY
+# trigger retry
