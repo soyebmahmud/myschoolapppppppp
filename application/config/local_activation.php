@@ -4,5 +4,6 @@ if (!defined('BASEPATH')) {
     exit('No direct script access allowed');
 }
 
-// Replace this hash with the bcrypt hash for the activation code used by your deployment.
-$config['local_activation_code_hash'] = '$2y$10$4xy3j0xK8xKQ8xKx4M9g9uVq4p4Qk3QvQ2j9fB4lBv2Q9jKQfG8mK';
+// Store only a bcrypt hash. The plaintext activation code is intentionally not
+// present in PHP, HTML, JavaScript, or public configuration.
+$config['local_activation_code_hash'] = '$2y$12$7UzyvXbzCxgdXdeNU90aY.Ppm.jlr4lCRWzVY4gs5My5gDq7w6k7O';
